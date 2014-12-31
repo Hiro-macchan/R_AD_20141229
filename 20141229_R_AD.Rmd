@@ -1,0 +1,281 @@
+---
+title: "2015年のお正月に向けて"
+output: html_document
+---
+
+## はじめに
+皆さんこんにちは。 @Hiro_macchan です。
+2014年も残すところあとわずかとなりました。いかがお過ごしでしょうか？  
+私は今年は進捗があまり出なかった年だったので、年末ロスタイムにいろいろ頑張りましたが、諦めて、来年は頑張ることにしました。  
+さて、この資料はR Advent Calendar 2014 の12/29分の資料です。  
+遅れた事をお詫び申し上げます。  
+
+## 資料の背景
+来年の頭にちょっと仕事でmixed-effect model とか GEE とかのお勉強をしないといけない機会があります。  
+いずれの手法も、パネルデータやクラスターの存在するデータに対して適応する手法です。    
+例えば私の場合、複数の医療施設から収集した観察データを解析して因果推論を行う際に、医療機関というクラスターを無視した解析を行うと、ちょっと困ったことになるので、その部分を適切に取り扱うために利用しています。  
+折角の機会なんで、シミュレーションを使った統計解析の手法比較をやってみようと思い立ちました。  
+さて、思い立ったのはいいのですが私には疑似データ作成の経験がない。  
+参考資料を探したところ以下のような資料が見つかりました。
+
+#### 人工データの発生(@yokkuns)  
+http://www.slideshare.net/yokkuns/tokyor35  
+
+#### RStan で作る人工データ（@kos59125）  
+http://blog.recyclebin.jp/archives/4194#more-4194  
+
+@kos59125 さんの資料を参考にRStan 使って華麗に疑似データ生成しようと思ったんですが、やってみたらきつかったので諦めました。  
+資料を参考に、階層データの分析を行っているStanコードのデータブロックとパラメーターブロックを入れ替えればいいかと思ったんですが、推察するに、Stanはパラメーターブロックにint が使えないため、クラスターIDをパラメーターとしてうまく生成できないみたいです。  
+残念ながら、僕のStan力が低いので、この推察が正しいのか全く分かりませんが、軽い気持ちでStan に手を出すと死ぬことがわかったのはこの年末に得た大きな収穫です。  
+
+ここで筆をおこうかと思ったのですが、さすがにそれはちょっとあれなんで、以下のサイトのコードを参考に新たに人工データ作成に取り組みました。
+
+#### R Advanced: Simulating the Hospital Doctor Patient Dataset
+http://www.ats.ucla.edu/stat/r/pages/mesimulation.htm
+
+
+## 階層を有する人工データの作成
+上記のサイトでは、病院―担当医師―患者という階層のある疑似的な医療データの作成を行っています。基本的なフローは  以下の通りです。  
+・病院毎の担当医師数、担当医師毎の患者数を指定  
+・変数数の内多変量正規分布に従う変数には平均値mu と共分散行列R を指定する。そのほかに、$\chi^2$二乗分布に従う変数も用意するのでたぶん自由度も指定する。  
+・病院・医師単位の変数を作成する。ここで、正規分布に従う誤差(Hint,Dint)を入れてデータにクラスターを作成する。  
+・患者単位の変数を用意する。  
+・変数間の交互作用項を用意する。
+・病院単位変数、医師単位変数、患者単位変数をまとめて、predictor matrix(dat) に格納する。  
+・アウトカムとの関連をモデル化した際の、モデルパラメーターを model parameter matrix(b)に格納する。  
+・アウトカムを$N(\mu,sd)$正規分布から発生させる。正規分布のパラメータ$mu$はdat %*% b$outcome で指定する。  
+・二値のアウトカムは正規分布を切って作ってる。  
+
+## 階層を有する人工データの作成
+では、上記の流れに沿ってデータを作っていきます。  
+作りたいデータは以下の通りです。  
+・病院単位でデータにクラスターがある。
+・病院単位・患者単位の変数を含む。
+・患者に対する治療(Treatment)は患者単位変数・病院単位変数の影響を受ける。
+・患者のアウトカム(Outcome)は患者単位変数・病院単位変数・Treatmentの影響を受ける。
+
+#### 関数の作成と必要となるlibrary の読み込み
+```{r message=FALSE}
+require(compiler)
+require(dplyr)
+require(MASS)
+require(tableone)
+require(lme4)
+require(corpcor)
+require(Epi)
+
+dmat <- cmpfun(function(i) {
+  #Create dummy matrix
+  j <- length(i)
+  n <- sum(i)
+  index <- cbind(start = cumsum(c(1, i[-j])), stop = cumsum(i))
+  H <- matrix(0, nrow = n, ncol = j)
+  for (i in 1:j) {
+    H[index[i, 1]:index[i, 2], i] <- 1L
+  }
+  return(H)
+})
+
+r <- cmpfun(function(n, mu, sigma, data) {
+  dmat(n) %*% rnorm(length(n), mu, sigma) * data
+})
+
+logit <- cmpfun(function(xb) 1/(1 + exp(-xb)))
+
+mycut <- cmpfun(function(x, p) {
+  cut(x = x, breaks = quantile(x, probs = p), labels = FALSE, include.lowest = TRUE)
+})
+
+hgraph <- cmpfun(function(data) {
+  oldpar <- par(no.readonly = TRUE)
+  on.exit(par(oldpar))
+  
+  n <- ncol(data)
+  ncol <- ceiling(sqrt(n))
+  nrow <- ceiling(n/ncol)
+  par(mfrow = c(nrow, ncol))
+  if (!is.null(colnames(data))) {
+    i <- colnames(data)
+  } else {
+    i <- seq(from = 1, to = n)
+  }
+  out <- lapply(i, function(x) {
+    if (is.numeric(data[, x])) {
+      hist(data[, x], main = x, xlab = "")
+    } else barplot(table(data[, x]), main = x, xlab = "", ylab = "Frequency")
+  })
+  return(invisible(out))
+})
+```
+
+#### 病院数、mu の設定など 
+```{r}
+## seed for simulation parameters
+# set.seed(1)
+
+# total number of hospitals
+k <- 200
+
+# number of patients within each hospital
+n <- sample(5:120, size = k, TRUE)
+# total number of patients
+j <- sum(n)
+
+mu <- list(int = 0,  
+           n_bed = 100, 
+           n_md = 30, 
+           cont = c(Age = 5, 
+                    Sex = 0.5,
+                    SBP = 10), 
+           bounded = c(LengthofStay = 14))
+R <- diag(3)
+rownames(R) <- names(mu$cont)
+R[1, 2] <- 0.3
+R[1, 3] <- 0.3
+R[2, 3] <- -0.5
+R[lower.tri(R)] <- t(R)[lower.tri(t(R))]
+(R <- cov2cor(make.positive.definite(R)))
+
+p <- list(sex = 0.4)
+```
+
+#### 病院単位変数の作成
+```{r}
+#Create hospital variables
+## hospital variables
+b <- cbind(HID = 1:k, 
+           Hint = rnorm(k, mean = mu$int, sd = 1), 
+           n_bed = rnorm(k, mean = mu$n_bed, sd = 1),
+           n_md = rnorm(k, mean = mu$n_md, sd = 1)) 
+H <-  dmat(n) %*% b
+hgraph(H)
+```
+
+#### 患者単位変数の作成
+```{r}
+#patient level variable
+#set.seed(38983)
+
+## continuous variables
+Xc <- as.data.frame(cbind(mvrnorm(n = j, mu = rep(0, 3), Sigma = R),
+                          sapply(mu$bounded, function(k) rchisq(n = j, df = k))))
+
+Xc <- within(Xc, {
+  Sex <- mycut(Sex, c(0, 1-p$sex, 1)) - 1
+  Age <- ((Age/1.6) + mu$cont["Age"]) * 10
+  SBP <- ((SBP/1.6) + mu$cont["SBP"]) * 10
+})
+
+## first few rows and histograms
+head(Xc)
+hgraph(Xc)
+
+```
+
+```{r}
+## create dummies and drop the intercept
+## dummy はないからXc をXに変換
+X <- Xc
+
+## Final for simulation
+dat <- cbind(X, H)
+dat <- as.matrix(dat[, -which(colnames(dat) %in% c("HID"))])
+
+hgraph(dat)
+
+```
+
+#### Treatmentを用意する。
+Treatは Treat_c とTreat_b の2種類を用意する。いずれも2値。    
+Treat_c は病院単位にクラスターがあるが、他の患者因子には関連がない。  
+Treat_b は病院単位にクラスターがあり、他の患者因子に関連している。
+```{r}
+#Create Parameter matix
+predict_name <- c("Treat_c", "Treat_b")
+b <- as.data.frame(rbind(
+  'Age' = c(0, 3),
+  'Sex' = c(0, 1),
+  'SBP' = c(0, 4),
+  'LengthofStay' = c(0,0),
+  'Hint' = c(2, 2),
+  'n_bed' = c(0,0),
+  'n_md' = c(0,0)  
+))
+b <- b / apply(dat, 2, sd)
+colnames(b) <- predict_name
+
+
+## Treatment continious
+treatment <- data.frame(Treat_c = as.numeric(rnorm(n = j, mean = (dat %*% b$Treat_c), sd = 15) > quantile((dat %*% b$Treat_c), probs = .75)))
+
+## Treatment dichotomous
+treatment$Treat_b <- as.numeric(rnorm(n = j, mean = (dat %*% b$Treat_b), sd = 15) > quantile((dat %*% b$Treat_b), probs = .75))
+
+```
+
+#### Outcome を用意する。
+Treatment をモデルに含めてOutcome_c, Outcome_bを用意する。
+いずれも2値。
+```{r}
+#Outcome を作る。
+dat_2 <- cbind(dat,as.matrix(treatment))
+hgraph(dat_2)
+
+#Create Parameter matix 2
+predict_name <- c("Outcome_c", "Outcome_b")
+b_2 <- as.data.frame(rbind(
+  'Age' = c(1, 1),
+  'Sex' = c(0, 0),
+  'SBP' = c(2, 2),
+  'LengthofStay' = c(0,0),
+  'Hint' = c(1, 1),
+  'n_bed' = c(2,0),
+  'n_md' = c(0,2),
+  'Treat_c' = c(2,2),
+  'Treat_b' = c(-3,-3)
+))
+b_2 <- b_2 / apply(dat_2, 2, sd)
+colnames(b_2) <- predict_name
+
+# Outcome_c を作る。
+Outcome <- data.frame(Outcome_c = as.numeric(rnorm(n = j, mean = (dat_2 %*% b_2$Outcome_c), sd = 15) > quantile((dat_2 %*% b_2$Outcome_c), probs = .75)))
+
+## Outcome_bを作る。
+Outcome$Outcome_b <- as.numeric(rnorm(n = j, mean = (dat_2 %*% b_2$Outcome_b), sd = 15) > quantile((dat_2 %*% b_2$Outcome_b), probs = .75))
+
+## データを統合してデータセットを作成する。
+finaldata <- cbind(Outcome, dat_2[,!(colnames(dat_2) %in% "Hint")],HID = H[,"HID"])
+finaldata <- within(finaldata, {
+  Sex <- factor(Sex, labels = c("female", "male"))
+  HID <- factor(HID)
+})
+
+
+hgraph(finaldata)
+
+```
+
+#### OutcomeとTreatmentの関連を普通のLogistic モデルと fixed-effect モデルで推計。
+```{r}
+Outcome_c.reg.glm<- glm(formula = Outcome_c ~ Age + SBP + Sex +Treat_b +Treat_c  + n_bed  + n_md + LengthofStay,family = "binomial",data=finaldata)
+summary(Outcome_c.reg.glm)
+
+
+Outcome_c.reg <- glmer(Outcome_c ~ Age + SBP + Sex  +Treat_b +Treat_c + n_bed + n_md  + LengthofStay + (1 | HID), data = finaldata, family = "binomial")
+summary(Outcome_c.reg, correlation=FALSE)
+
+Outcome_b.reg.glm<- glm(formula = Outcome_b ~ Age + SBP + Sex +Treat_b +Treat_c  + n_bed  + n_md + LengthofStay,family = "binomial",data=finaldata)
+summary(Outcome_b.reg.glm)
+
+Outcome_b.reg <- glmer(Outcome_b ~ Age + SBP + Sex +Treat_b +Treat_c  + n_bed  + n_md + LengthofStay + (1 | HID), data = finaldata, family = "binomial")
+summary(Outcome_b.reg, correlation=FALSE)
+
+```
+
+## まとめ
+とりあえず、データの生成は何とかなりました。  
+ちょっと普通のLogistic モデルとfixed-effect model の違いが見づらいですが、
+データをたくさん作って推計値の分布を見てみれば特性が見えるかなぁと思います。  
+正月はこれを使っていくつかやりたいシミュレーションをやってみたいと思います。  
+来年は頑張ろう。  
+そんなわけで、皆さん今年も御世話になりました。来年もよろしくお願いします。
